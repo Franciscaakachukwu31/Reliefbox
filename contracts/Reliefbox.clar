@@ -8,6 +8,12 @@
 (define-constant ERR_INVALID_AMOUNT (err u106))
 (define-constant ERR_EMERGENCY_PAUSED (err u107))
 (define-constant ERR_REWARD_PROCESSING_FAILED (err u108))
+(define-constant ERR_CAMPAIGN_NOT_FOUND (err u109))
+(define-constant ERR_CAMPAIGN_EXPIRED (err u110))
+(define-constant ERR_CAMPAIGN_NOT_ACTIVE (err u111))
+(define-constant ERR_INSUFFICIENT_MATCHING_FUNDS (err u112))
+(define-constant ERR_CAMPAIGN_ALREADY_EXISTS (err u113))
+(define-constant ERR_INVALID_CAMPAIGN_PARAMS (err u114))
 
 (define-data-var total-donations uint u0)
 (define-data-var total-withdrawals uint u0)
@@ -73,6 +79,36 @@
     special-benefits: (string-ascii 100)
 })
 
+(define-map matching-campaigns uint {
+    name: (string-ascii 100),
+    description: (string-ascii 300),
+    sponsor: principal,
+    target-organization: (optional principal),
+    start-block: uint,
+    end-block: uint,
+    matching-ratio-numerator: uint,
+    matching-ratio-denominator: uint,
+    max-matching-amount: uint,
+    current-matched-amount: uint,
+    total-donations-received: uint,
+    active: bool,
+    created-at: uint
+})
+
+(define-map campaign-donations uint {
+    campaign-id: uint,
+    donor: principal,
+    amount: uint,
+    matched-amount: uint,
+    donated-at: uint
+})
+
+(define-map campaign-participant-stats principal {
+    total-campaigns-donated: uint,
+    total-matched-received: uint,
+    favorite-campaign-type: (string-ascii 50)
+})
+
 (define-data-var achievement-counter uint u0)
 (define-data-var referral-bonus-percentage uint u5)
 
@@ -80,6 +116,9 @@
 (define-data-var total-reward-points uint u0)
 (define-data-var loyalty-tier-threshold uint u1000)
 (define-data-var reward-multiplier uint u10)
+
+(define-data-var matching-campaign-counter uint u0)
+(define-data-var total-matched-funds uint u0)
 
 (define-public (donate)
     (let ((donation-amount (stx-get-balance tx-sender)))
@@ -236,6 +275,103 @@
         })
         (ok true)))
 
+(define-public (create-matching-campaign 
+    (name (string-ascii 100)) 
+    (description (string-ascii 300)) 
+    (target-organization (optional principal)) 
+    (duration-blocks uint) 
+    (matching-ratio-numerator uint) 
+    (matching-ratio-denominator uint) 
+    (max-matching-amount uint))
+    (let ((campaign-id (+ (var-get matching-campaign-counter) u1))
+          (sponsor-balance (stx-get-balance tx-sender))
+          (start-block stacks-block-height)
+          (end-block (+ stacks-block-height duration-blocks)))
+        (asserts! (> duration-blocks u0) ERR_INVALID_CAMPAIGN_PARAMS)
+        (asserts! (> matching-ratio-numerator u0) ERR_INVALID_CAMPAIGN_PARAMS)
+        (asserts! (> matching-ratio-denominator u0) ERR_INVALID_CAMPAIGN_PARAMS)
+        (asserts! (> max-matching-amount u0) ERR_INVALID_CAMPAIGN_PARAMS)
+        (asserts! (>= sponsor-balance max-matching-amount) ERR_INSUFFICIENT_MATCHING_FUNDS)
+        (asserts! (not (var-get contract-paused)) ERR_EMERGENCY_PAUSED)
+        (match target-organization
+            org (asserts! (is-organization-verified org) ERR_ORGANIZATION_NOT_VERIFIED)
+            true)
+        (try! (stx-transfer? max-matching-amount tx-sender (as-contract tx-sender)))
+        (var-set matching-campaign-counter campaign-id)
+        (map-set matching-campaigns campaign-id {
+            name: name,
+            description: description,
+            sponsor: tx-sender,
+            target-organization: target-organization,
+            start-block: start-block,
+            end-block: end-block,
+            matching-ratio-numerator: matching-ratio-numerator,
+            matching-ratio-denominator: matching-ratio-denominator,
+            max-matching-amount: max-matching-amount,
+            current-matched-amount: u0,
+            total-donations-received: u0,
+            active: true,
+            created-at: stacks-block-height
+        })
+        (ok campaign-id)))
+
+(define-public (donate-to-campaign (campaign-id uint))
+    (let ((campaign (unwrap! (map-get? matching-campaigns campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+          (donation-amount (stx-get-balance tx-sender)))
+        (asserts! (> donation-amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (not (var-get contract-paused)) ERR_EMERGENCY_PAUSED)
+        (asserts! (get active campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (>= stacks-block-height (get start-block campaign)) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (< stacks-block-height (get end-block campaign)) ERR_CAMPAIGN_EXPIRED)
+        (match (get target-organization campaign)
+            target-org (asserts! (is-organization-verified target-org) ERR_ORGANIZATION_NOT_VERIFIED)
+            true)
+        (let ((matching-amount (calculate-matching-amount campaign-id donation-amount))
+              (total-needed (+ donation-amount matching-amount)))
+            (try! (stx-transfer? donation-amount tx-sender (as-contract tx-sender)))
+            (var-set total-donations (+ (var-get total-donations) donation-amount))
+            (map-set donations tx-sender {
+                total-donated: (+ (get-donation-total tx-sender) donation-amount),
+                donation-count: (+ (get-donation-count tx-sender) u1),
+                first-donation-block: (match (map-get? donations tx-sender)
+                    existing-donation (get first-donation-block existing-donation)
+                    stacks-block-height)
+            })
+            (map-set matching-campaigns campaign-id
+                (merge campaign {
+                    current-matched-amount: (+ (get current-matched-amount campaign) matching-amount),
+                    total-donations-received: (+ (get total-donations-received campaign) donation-amount)
+                }))
+            (var-set total-matched-funds (+ (var-get total-matched-funds) matching-amount))
+            (begin
+                (unwrap-panic (process-donation-rewards tx-sender (+ donation-amount matching-amount)))
+                (unwrap-panic (update-campaign-participant-stats tx-sender campaign-id matching-amount))
+                (ok {donation-amount: donation-amount, matched-amount: matching-amount})))))
+
+(define-public (end-campaign (campaign-id uint))
+    (let ((campaign (unwrap! (map-get? matching-campaigns campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+          (unused-matching-funds (- (get max-matching-amount campaign) (get current-matched-amount campaign))))
+        (asserts! (is-eq tx-sender (get sponsor campaign)) ERR_UNAUTHORIZED)
+        (asserts! (get active campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (map-set matching-campaigns campaign-id
+            (merge campaign {active: false}))
+        (if (> unused-matching-funds u0)
+            (try! (as-contract (stx-transfer? unused-matching-funds tx-sender (get sponsor campaign))))
+            true)
+        (ok unused-matching-funds)))
+
+(define-public (emergency-end-campaign (campaign-id uint))
+    (let ((campaign (unwrap! (map-get? matching-campaigns campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+          (unused-matching-funds (- (get max-matching-amount campaign) (get current-matched-amount campaign))))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (get active campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (map-set matching-campaigns campaign-id
+            (merge campaign {active: false}))
+        (if (> unused-matching-funds u0)
+            (try! (as-contract (stx-transfer? unused-matching-funds tx-sender (get sponsor campaign))))
+            true)
+        (ok unused-matching-funds)))
+
 (define-public (claim-achievement (achievement-id uint))
     (let ((achievement (unwrap! (map-get? achievement-definitions achievement-id) ERR_ORGANIZATION_NOT_FOUND))
           (donor-reward (get-donor-reward-data tx-sender)))
@@ -334,6 +470,43 @@
           (achievements (get achievements donor-reward)))
         (is-some (index-of achievements achievement-id))))
 
+(define-private (calculate-matching-amount (campaign-id uint) (donation-amount uint))
+    (let ((campaign (unwrap! (map-get? matching-campaigns campaign-id) u0)))
+        (if (get active campaign)
+            (let ((potential-match (/ (* donation-amount (get matching-ratio-numerator campaign)) 
+                                     (get matching-ratio-denominator campaign)))
+                  (remaining-funds (- (get max-matching-amount campaign) 
+                                    (get current-matched-amount campaign))))
+                (if (> potential-match remaining-funds)
+                    remaining-funds
+                    potential-match))
+            u0)))
+
+(define-private (update-campaign-participant-stats (participant principal) (campaign-id uint) (matched-amount uint))
+    (let ((current-stats (get-campaign-participant-stats participant)))
+        (map-set campaign-participant-stats participant {
+            total-campaigns-donated: (+ (get total-campaigns-donated current-stats) u1),
+            total-matched-received: (+ (get total-matched-received current-stats) matched-amount),
+            favorite-campaign-type: "general"
+        })
+        (ok true)))
+
+(define-private (get-campaign-participant-stats (participant principal))
+    (match (map-get? campaign-participant-stats participant)
+        existing-stats existing-stats
+        {
+            total-campaigns-donated: u0,
+            total-matched-received: u0,
+            favorite-campaign-type: "general"
+        }))
+
+(define-private (is-campaign-active (campaign-id uint))
+    (match (map-get? matching-campaigns campaign-id)
+        campaign (and (get active campaign)
+                     (>= stacks-block-height (get start-block campaign))
+                     (< stacks-block-height (get end-block campaign)))
+        false))
+
 (define-private (get-donor-reward-data (donor principal))
     (match (map-get? donor-rewards donor)
         existing-reward existing-reward
@@ -431,6 +604,45 @@
         referral-bonus-percentage: (var-get referral-bonus-percentage)
     })
 
+(define-read-only (get-matching-campaign (campaign-id uint))
+    (map-get? matching-campaigns campaign-id))
+
+(define-read-only (get-campaign-donation-info (campaign-id uint) (donor principal))
+    (map-get? campaign-donations campaign-id))
+
+(define-read-only (get-campaign-participant-info (participant principal))
+    (get-campaign-participant-stats participant))
+
+(define-read-only (calculate-potential-match (campaign-id uint) (donation-amount uint))
+    (calculate-matching-amount campaign-id donation-amount))
+
+(define-read-only (is-campaign-currently-active (campaign-id uint))
+    (is-campaign-active campaign-id))
+
+(define-read-only (get-campaign-stats (campaign-id uint))
+    (match (map-get? matching-campaigns campaign-id)
+        campaign (some {
+            total-donations: (get total-donations-received campaign),
+            total-matched: (get current-matched-amount campaign),
+            remaining-match-funds: (- (get max-matching-amount campaign) 
+                                    (get current-matched-amount campaign)),
+            match-ratio: {numerator: (get matching-ratio-numerator campaign), 
+                         denominator: (get matching-ratio-denominator campaign)},
+            active: (and (get active campaign)
+                        (>= stacks-block-height (get start-block campaign))
+                        (< stacks-block-height (get end-block campaign))),
+            blocks-remaining: (if (>= stacks-block-height (get end-block campaign))
+                                u0
+                                (- (get end-block campaign) stacks-block-height))
+        })
+        none))
+
+(define-read-only (get-total-matched-funds)
+    (var-get total-matched-funds))
+
+(define-read-only (get-matching-campaigns-count)
+    (var-get matching-campaign-counter))
+
 (define-read-only (get-contract-stats)
     {
         total-donations: (var-get total-donations),
@@ -440,5 +652,10 @@
         emergency-fund: (get-emergency-fund),
         emergency-fund-percentage: (var-get emergency-fund-percentage),
         contract-paused: (var-get contract-paused),
-        emergency-releases-count: (var-get emergency-release-counter)
+        emergency-releases-count: (var-get emergency-release-counter),
+        total-matched-funds: (var-get total-matched-funds),
+        active-campaigns-count: (var-get matching-campaign-counter)
     })
+
+
+
